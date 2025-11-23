@@ -9,13 +9,13 @@ st.set_page_config(page_title="Plant Pathogen Identifier", page_icon="🌿")
 @st.cache_resource
 def load_model():
     # Load TFLite model
-    interpreter = tflite.Interpreter(model_path="pathogen_model_ResNet50.tflite")
+    interpreter = tflite.Interpreter(model_path="ResNet50/pathogen_model_ResNet50.tflite")
     interpreter.allocate_tensors()
     return interpreter
 
 @st.cache_data
 def load_class_names():
-    with open('pathogen_labels.txt', 'r') as f:
+    with open('ResNet50/pathogen_labels.txt', 'r') as f:
         class_names = f.read().splitlines()
     return class_names
 
@@ -96,3 +96,4 @@ if uploaded_file is not None:
                 
             except Exception as e:
                 st.error(f"Error: {e}")
+
