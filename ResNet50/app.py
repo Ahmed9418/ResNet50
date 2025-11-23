@@ -68,7 +68,7 @@ def predict(image, interpreter, class_names):
     return predicted_class, confidence
 
 # --- UI Interface ---
-st.title("🌿 Plant Pathogen Identifier (Lite)")
+st.title("🌿 Plant Pathogen Identifier (ResNet50)/(Plant_Village)")
 st.write("Upload a leaf image to detect diseases.")
 
 try:
@@ -96,4 +96,5 @@ if uploaded_file is not None:
                 
             except Exception as e:
                 st.error(f"Error: {e}")
+
 
