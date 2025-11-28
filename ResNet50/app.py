@@ -1,100 +1,172 @@
 import streamlit as st
 import numpy as np
-from PIL import Image
-import tensorflow.lite as tflite # Using standard TF-CPU Lite interpreter
+import tensorflow as tf
+from PIL import Image, ImageOps, ImageDraw
+import io
+import os
 
-# Page Config
-st.set_page_config(page_title="Plant Pathogen Identifier", page_icon="🌿")
+# --- Configuration ---
+current_dir = os.path.dirname(os.path.abspath(__file__))
 
+# ❗ UPDATE THIS FILE NAME to your actual ResNet50 TFLite model
+MODEL_PATH = os.path.join(current_dir, 'pathogen_model_final.tflite') 
+
+CLASS_LABELS = [
+    "Bacteria",
+    "Fungi",
+    "Healthy",
+    "Pests",
+    "Virus"
+]
+
+# --- 1. Model Loading ---
 @st.cache_resource
-def load_model():
-    # Load TFLite model
-    interpreter = tflite.Interpreter(model_path="ResNet50/pathogen_model_ResNet50.tflite")
-    interpreter.allocate_tensors()
-    return interpreter
+def load_tflite_model():
+    if not os.path.exists(MODEL_PATH):
+        st.error(f"❌ Model file not found at: {MODEL_PATH}")
+        return None
+    try:
+        interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+        interpreter.allocate_tensors()
+        return interpreter
+    except Exception as e:
+        st.error(f"Error loading model: {e}")
+        return None
 
-@st.cache_data
-def load_class_names():
-    with open('ResNet50/pathogen_labels.txt', 'r') as f:
-        class_names = f.read().splitlines()
-    return class_names
+# --- 2. Robust Preprocessing (UPDATED FOR RESNET50) ---
+def preprocess_pil_image(pil_img, input_details):
+    input_shape = input_details[0]['shape'] 
+    target_height = input_shape[1]
+    target_width = input_shape[2]
 
-def preprocess_image(image, target_size=(224, 224)):
-    # 1. Resize
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    img = image.resize(target_size)
+    # Convert to RGB
+    img = pil_img.convert('RGB')
     
-    # 2. Convert to Numpy Array
-    img_array = np.array(img).astype(np.float32)
-    
-    # 3. Manual ResNet50 Preprocessing
-    # ResNet50 expects BGR format, not RGB
-    # It also subtracts the mean values of ImageNet
-    
-    # Convert RGB to BGR
-    img_array = img_array[..., ::-1]
-    
-    # Mean subtraction (ImageNet means: [103.939, 116.779, 123.68])
-    mean = [103.939, 116.779, 123.68]
-    img_array[..., 0] -= mean[0]
-    img_array[..., 1] -= mean[1]
-    img_array[..., 2] -= mean[2]
-    
-    # 4. Add Batch Dimension
+    # Resize to 224x224 (Model Input Size)
+    # Using LANCZOS for high-quality downsampling
+    img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+    # Convert to Array (Keep as 0-255 float32)
+    img_array = np.array(img, dtype=np.float32)
     img_array = np.expand_dims(img_array, axis=0)
+    
+    # --- RESNET50 SPECIFIC PREPROCESSING ---
+    # ResNet50 expects BGR channels and mean subtraction (Caffe style).
+    # This function handles all that math automatically.
+    # Note: It expects inputs in range [0, 255], NOT [0, 1] or [-1, 1]
+    img_array = tf.keras.applications.resnet50.preprocess_input(img_array)
     
     return img_array
 
-def predict(image, interpreter, class_names):
+# --- 3. Prediction with TTA ---
+def predict_with_tta(interpreter, pil_image):
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
     
-    # Preprocess
-    processed_image = preprocess_image(image)
+    predictions = []
     
-    # Set Tensor
-    interpreter.set_tensor(input_details[0]['index'], processed_image)
-    
-    # Run Inference
+    # Pass 1: Original
+    processed_1 = preprocess_pil_image(pil_image, input_details)
+    interpreter.set_tensor(input_details[0]['index'], processed_1)
     interpreter.invoke()
+    predictions.append(interpreter.get_tensor(output_details[0]['index'])[0])
     
-    # Get Output
-    predictions = interpreter.get_tensor(output_details[0]['index'])
+    # Pass 2: Mirrored (Horizontal Flip)
+    flipped_img = pil_image.transpose(Image.FLIP_LEFT_RIGHT)
+    processed_2 = preprocess_pil_image(flipped_img, input_details)
+    interpreter.set_tensor(input_details[0]['index'], processed_2)
+    interpreter.invoke()
+    predictions.append(interpreter.get_tensor(output_details[0]['index'])[0])
     
-    confidence = np.max(predictions[0])
-    predicted_class = class_names[np.argmax(predictions[0])]
+    return np.mean(predictions, axis=0)
+
+# --- 4. Main App UI ---
+def main():
+    st.set_page_config(page_title="Plant Care AI (ResNet)", page_icon="🌿")
+    st.title("🌿 Plant Pathogen Identifier (ResNet50)")
     
-    return predicted_class, confidence
+    interpreter = load_tflite_model()
+    if interpreter is None: return
 
-# --- UI Interface ---
-st.title("🌿 Plant Pathogen Identifier (ResNet50)/(Plant_Village)")
-st.write("Upload a leaf image to detect diseases.")
+    uploaded_file = st.file_uploader("Upload Plant Photo", type=["jpg", "jpeg", "png"])
 
-try:
-    interpreter = load_model()
-    class_names = load_class_names()
-    st.success("System ready!")
-except Exception as e:
-    st.error(f"Error loading resources: {e}")
-    st.stop()
+    if uploaded_file is not None:
+        # Load and Fix Rotation immediately
+        original_image = Image.open(uploaded_file)
+        original_image = ImageOps.exif_transpose(original_image)
+        
+        # --- TARGETING TOOL ---
+        st.markdown("### 🎯 Step 1: Target the Disease")
+        st.info("Use the controls to place the RED BOX over the sickest leaf.")
+        
+        # 1. Controls
+        col_controls_1, col_controls_2 = st.columns(2)
+        with col_controls_1:
+            zoom = st.slider("🔍 Zoom", 1.0, 5.0, 1.0, 0.1)
+        
+        # Calculate Box Size (Force Square Crop)
+        img_w, img_h = original_image.size
+        min_dim = min(img_w, img_h)
+        box_size = int(min_dim / zoom)
+        
+        # Calculate Max Offsets
+        max_x = img_w - box_size
+        max_y = img_h - box_size
+        
+        with col_controls_2:
+            # Use percentages for sliders to make them responsive
+            x_pct = st.slider("↔️ Move Left/Right", 0, 100, 50)
+            y_pct = st.slider("↕️ Move Up/Down", 0, 100, 50)
+            
+        # Convert % to pixels
+        x_offset = int((x_pct / 100) * max_x)
+        y_offset = int((y_pct / 100) * max_y)
+        
+        # Define Crop Box
+        left = x_offset
+        top = y_offset
+        right = x_offset + box_size
+        bottom = y_offset + box_size
+        
+        # Perform Crop
+        final_image = original_image.crop((left, top, right, bottom))
+        
+        # --- VISUALIZATION ---
+        # Draw Red Box on a Copy of Original
+        preview_img = original_image.copy()
+        draw = ImageDraw.Draw(preview_img)
+        draw.rectangle([left, top, right, bottom], outline="red", width=int(min_dim*0.02))
+        
+        # Display Side-by-Side
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption("Full Image (Red Box = Analysis Area)")
+            st.image(preview_img, use_column_width=True)
+        with col2:
+            st.caption("What the AI Sees (Must show disease!)")
+            st.image(final_image, use_column_width=True)
+            
+        # Warning if resolution is too low
+        if box_size < 224:
+            st.warning("⚠️ Warning: You zoomed in too much! The image is blurry. The AI might struggle.")
 
-uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
-
-if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    st.image(image, caption='Uploaded Image', use_column_width=True)
-    
-    if st.button('Analyze Leaf'):
-        with st.spinner('Processing...'):
-            try:
-                label, confidence = predict(image, interpreter, class_names)
+        # --- ANALYZE ---
+        st.markdown("---")
+        if st.button("Analyze Target Area", type="primary"):
+            with st.spinner("Analyzing..."):
+                probabilities = predict_with_tta(interpreter, final_image)
                 
-                st.markdown(f"### Result: **{label}**")
-                st.progress(float(confidence))
-                st.write(f"Confidence: {confidence * 100:.2f}%")
+                # Results
+                pred_idx = np.argmax(probabilities)
+                confidence = probabilities[pred_idx] * 100
+                label = CLASS_LABELS[pred_idx]
                 
-            except Exception as e:
-                st.error(f"Error: {e}")
+                if "Healthy" in label:
+                    st.success(f"✅ Prediction: **{label}** ({confidence:.1f}%)")
+                else:
+                    st.error(f"🚨 Pathogen: **{label}** ({confidence:.1f}%)")
+                
+                st.bar_chart({l: p*100 for l, p in zip(CLASS_LABELS, probabilities)})
 
-
+if __name__ == "__main__":
+    main()
